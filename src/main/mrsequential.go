@@ -6,13 +6,16 @@ package main
 // go run mrsequential.go wc.so pg*.txt
 //
 
-import "fmt"
-import "6.5840/mr"
-import "plugin"
-import "os"
-import "log"
-import "io/ioutil"
-import "sort"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"plugin"
+	"sort"
+
+	"6.5840/mr"
+)
 
 // for sorting by key.
 type ByKey []mr.KeyValue
@@ -82,7 +85,15 @@ func main() {
 
 		i = j
 	}
-
+	/*将返回的形如
+	  {"hello", "1"},
+	  	{"world", "1"},
+	  	{"world", "1"},
+	  	{"world", "1"},
+	  	{"hello", "1"},
+	  	{"test",  "1"},
+	  	依照键对其数量进行累加，最后写入到mr-out-0文件中
+	*/
 	ofile.Close()
 }
 
