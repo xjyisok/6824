@@ -8,6 +8,8 @@ package raft
 
 import (
 	//	"bytes"
+
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,14 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
+)
+
+const (
+	// 心跳间隔（尽量低一些，但别太低，避免 TestCount3B 的 idle RPC 超标）
+	heartbeatInterval = 120 * time.Millisecond
+	// 选举超时随机区间
+	electionTimeoutMin = 300 * time.Millisecond
+	electionTimeoutMax = 550 * time.Millisecond
 )
 
 const (
@@ -50,6 +60,7 @@ type Raft struct {
 	matchIndex []int
 	//超时重选时间
 	electionResetEvent time.Time
+	applyCh            chan raftapi.ApplyMsg
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -69,6 +80,13 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+func (rf *Raft) getlastlogIndex() int {
+	return len(rf.log) - 1
+}
+func (rf *Raft) getlastlogterm() int {
+	return rf.log[rf.getlastlogIndex()].Term
+}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -82,39 +100,124 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.Term > rf.currentTerm {
 		rf.convertToFollower(args.Term)
+		reply.Term = rf.currentTerm
 	}
-
 	rf.electionResetEvent = time.Now()
-	reply.Success = true
-}
-func (rf *Raft) broadcastHeartbeat() {
-	rf.mu.Lock()
-	if rf.state != Leader {
-		rf.mu.Unlock()
+	//如果复制请求的日志的索引大于follower的索引需要拒绝复制让leader回退
+	if args.PrevLogIndex > rf.getlastlogIndex() {
 		return
 	}
+	if args.PrevLogIndex >= 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		return
+	}
+	indexforstart := args.PrevLogIndex + 1
+	for i, e := range args.Entries {
+		indexforinsert := indexforstart + i
+		if rf.getlastlogIndex() >= indexforinsert {
+			if rf.getlastlogterm() != e.Term {
+				rf.log = rf.log[:indexforinsert]
+				rf.log = append(rf.log, e)
+			}
+		} else {
+			rf.log = append(rf.log, e)
+		}
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(rf.getlastlogIndex())))
+	}
+	reply.Term = rf.currentTerm
+	reply.Success = true
+}
+
+func (rf *Raft) broadcastHeartbeat() {
+	//rf.mu.Lock()
+	// if rf.state != Leader {
+	// 	rf.mu.Unlock()
+	// 	return
+	// }
 	term := rf.currentTerm
-	me := rf.me
-	rf.mu.Unlock()
+	//rf.mu.Unlock()
 
 	for i := range rf.peers {
-		if i == me {
+		if i == rf.me {
 			continue
 		}
-		go func(server int) {
-			args := &AppendEntriesArgs{Term: term, LeaderId: me}
+		peer := i
+		previndex := rf.nextIndex[i] - 1
+		prevterm := 0
+		if previndex >= 0 && previndex <= rf.getlastlogIndex() {
+			prevterm = rf.log[previndex].Term
+		}
+		Entries := make([]LogEntry, 0)
+		if rf.nextIndex[i] <= rf.getlastlogIndex() {
+			Entries = append(Entries, rf.log[rf.nextIndex[peer]:]...)
+		}
+		args := &AppendEntriesArgs{
+			Term:         term,
+			LeaderId:     rf.me,
+			PrevLogIndex: previndex,
+			PrevLogTerm:  prevterm,
+			Entries:      Entries,
+			LeaderCommit: rf.commitIndex,
+		}
+		go func(server int, a *AppendEntriesArgs) {
 			reply := &AppendEntriesReply{}
-			ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-			if ok {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				if reply.Term > rf.currentTerm {
-					rf.convertToFollower(reply.Term)
+			ok := rf.peers[server].Call("Raft.AppendEntries", a, reply)
+			if !ok {
+				return
+			}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Term > rf.currentTerm {
+				rf.convertToFollower(reply.Term)
+				return
+			}
+			if rf.state != Leader || a.Term != rf.currentTerm {
+				return
+			}
+			if reply.Success {
+				if len(a.Entries) > 0 {
+					lastsent := a.PrevLogIndex + len(a.Entries)
+					if lastsent+1 > rf.nextIndex[server] {
+						rf.nextIndex[server] = lastsent + 1
+						rf.matchIndex[server] = lastsent
+					}
+				} else {
+					if rf.nextIndex[server] < rf.getlastlogIndex()+1 {
+						rf.nextIndex[server] = rf.getlastlogIndex() + 1
+					}
+				}
+				rf.advanceCommitIndexUnlocked()
+			} else {
+				if rf.nextIndex[server] > 1 {
+					rf.nextIndex[server]--
 				}
 			}
-		}(i)
+		}(peer, args)
 	}
 }
+func (rf *Raft) advanceCommitIndexUnlocked() {
+	// 调用者持锁
+	N := rf.getlastlogIndex()
+	for i := rf.commitIndex + 1; i <= N; i++ {
+		if rf.log[i].Term != rf.currentTerm {
+			continue // 只提交当前任期的条目（重要！）
+		}
+		count := 1 // 包含 leader 自己
+		for s := range rf.peers {
+			if s == rf.me {
+				continue
+			}
+			if rf.matchIndex[s] >= i {
+				count++
+			}
+		}
+		if count*2 > len(rf.peers) {
+			rf.commitIndex = i
+		}
+	}
+}
+
 func (rf *Raft) startElection() {
 	rf.state = Candidate
 	rf.currentTerm++
@@ -189,6 +292,25 @@ func (rf *Raft) startElection() {
 	case <-time.After(time.Duration(300+rand.Intn(150)) * time.Millisecond):
 		// 超时未选出 Leader，下次 ticker 会重新发起选举
 		return
+	}
+}
+func (rf *Raft) applier() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			msg := raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied,
+			}
+			applyCh := rf.applyCh
+			rf.mu.Unlock()
+			applyCh <- msg
+			rf.mu.Lock()
+		}
+		rf.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -267,11 +389,11 @@ type RequestVoteArgs struct {
 }
 
 func (rf *Raft) convertToFollower(newTerm int) {
-	DPrintf("[S%v] convertToFollower term %v -> %v", rf.me, rf.currentTerm, newTerm)
+	//DPrintf("[S%v] convertToFollower term %v -> %v", rf.me, rf.currentTerm, newTerm)
 	rf.state = Follower
 	rf.currentTerm = newTerm
 	rf.votedFor = -1
-	rf.persist()
+	//rf.persist()
 }
 
 // example RequestVote RPC reply structure.
@@ -365,7 +487,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.currentTerm, false
 	}
 	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
-	return len(rf.log) - 1, rf.currentTerm, true
+	index := rf.getlastlogIndex()
+	rf.broadcastHeartbeat()
+	return index, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -388,24 +512,40 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	electionTimeout := time.Duration(300+rand.Intn(150)) * time.Millisecond
+	// periodically check timeouts, send heartbeats, or start elections
+	heartbeatTicker := time.NewTicker(heartbeatInterval)
+	defer heartbeatTicker.Stop()
 
 	for !rf.killed() {
-		time.Sleep(10 * time.Millisecond) // 避免忙等
+		time.Sleep(10 * time.Millisecond)
 
 		rf.mu.Lock()
 		state := rf.state
 		elapsed := time.Since(rf.electionResetEvent)
+		timeout := rf.electionTimeout()
 		rf.mu.Unlock()
 
-		if state == Leader {
-			rf.broadcastHeartbeat()
-		} else if elapsed >= electionTimeout {
-			rf.startElection()
-			// 重置随机 electionTimeout
-			electionTimeout = time.Duration(300+rand.Intn(150)) * time.Millisecond
+		switch state {
+		case Leader:
+			select {
+			case <-heartbeatTicker.C:
+				rf.mu.Lock()
+				// 发送心跳或日志
+				rf.broadcastHeartbeat()
+				rf.mu.Unlock()
+			default:
+			}
+		default:
+			if elapsed >= timeout {
+				// 超时发起选举
+				rf.startElection()
+			}
 		}
 	}
+}
+func (rf *Raft) electionTimeout() time.Duration {
+	d := electionTimeoutMin + time.Duration(rand.Int63())%(electionTimeoutMax-electionTimeoutMin)
+	return d
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -426,6 +566,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.votedFor = -1
 	rf.log = []LogEntry{{Term: 0}} // dummy entry
+	rf.applyCh = applyCh
 	rf.electionResetEvent = time.Now()
 	// Your initialization code here (3A, 3B, 3C).
 
@@ -434,6 +575,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	go rf.applier()
 	return rf
 }
